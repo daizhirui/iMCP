@@ -72,9 +72,13 @@ final class RemindersService: Service {
         var ids = Set<String>()
         let prefix = "x-apple-reminder://"
         if result.descriptorType == typeAEList {
-            for i in 1...max(result.numberOfItems, 0) {
-                guard let item = result.atIndex(i), let s = item.stringValue else { continue }
-                ids.insert(s.hasPrefix(prefix) ? String(s.dropFirst(prefix.count)) : s)
+            // numberOfItems can be 0 for an empty AE list; guard before iterating
+            // because Swift's `1...0` is an invalid ClosedRange and traps.
+            if result.numberOfItems > 0 {
+                for i in 1...result.numberOfItems {
+                    guard let item = result.atIndex(i), let s = item.stringValue else { continue }
+                    ids.insert(s.hasPrefix(prefix) ? String(s.dropFirst(prefix.count)) : s)
+                }
             }
         } else if let s = result.stringValue {
             // Single-item return (e.g. only one reminder) may decode as a plain string.
