@@ -216,7 +216,11 @@ final class CalendarService: Service {
                 events = events.filter { ($0.hasRecurrenceRules) == isRecurring }
             }
 
-            return events.map { Event($0) }
+            return events.map { event -> Event in
+                var snapshot = Event(event)
+                snapshot.identifier = event.eventIdentifier
+                return snapshot
+            }
         }
         Tool(
             name: "events_create",
@@ -533,7 +537,84 @@ final class CalendarService: Service {
             // Save the event
             try self.eventStore.save(event, span: .thisEvent)
 
-            return Event(event)
+            var snapshot = Event(event)
+            snapshot.identifier = event.eventIdentifier
+            return snapshot
+        }
+
+        Tool(
+            name: "events_delete",
+            description:
+                "Delete one or more calendar events by their identifiers. For recurring events, 'span' controls whether to remove just this occurrence or all future occurrences. Removals are batched and committed atomically.",
+            inputSchema: .object(
+                properties: [
+                    "ids": .array(
+                        description:
+                            "Identifiers of events to delete (the '@id' values returned by events_fetch or events_create).",
+                        items: .string()
+                    ),
+                    "span": .string(
+                        description:
+                            "For recurring events: 'thisEvent' removes only this occurrence; 'futureEvents' removes this and all future occurrences. Ignored for non-recurring events.",
+                        default: .string(EKSpan.thisEvent.stringValue),
+                        enum: EKSpan.allCases.map { .string($0.stringValue) }
+                    ),
+                ],
+                required: ["ids"],
+                additionalProperties: false
+            ),
+            annotations: .init(
+                title: "Delete Events",
+                destructiveHint: true,
+                openWorldHint: false
+            )
+        ) { arguments in
+            try await self.activate()
+
+            guard EKEventStore.authorizationStatus(for: .event) == .fullAccess else {
+                log.error("Calendar access not authorized")
+                throw NSError(
+                    domain: "CalendarError",
+                    code: 1,
+                    userInfo: [NSLocalizedDescriptionKey: "Calendar access not authorized"]
+                )
+            }
+
+            guard case .array(let idValues) = arguments["ids"], !idValues.isEmpty else {
+                throw NSError(
+                    domain: "CalendarError",
+                    code: 2,
+                    userInfo: [NSLocalizedDescriptionKey: "At least one event id is required"]
+                )
+            }
+
+            let span: EKSpan
+            if case .string(let spanStr) = arguments["span"] {
+                span = EKSpan(spanStr)
+            } else {
+                span = .thisEvent
+            }
+
+            var removed: [Event] = []
+            for case .string(let id) in idValues {
+                guard let event = self.eventStore.event(withIdentifier: id) else {
+                    throw NSError(
+                        domain: "CalendarError",
+                        code: 3,
+                        userInfo: [
+                            NSLocalizedDescriptionKey: "No event found with id '\(id)'"
+                        ]
+                    )
+                }
+                var snapshot = Event(event)
+                snapshot.identifier = event.eventIdentifier
+                try self.eventStore.remove(event, span: span, commit: false)
+                removed.append(snapshot)
+            }
+
+            try self.eventStore.commit()
+
+            return removed
         }
     }
 }

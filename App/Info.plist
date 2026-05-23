@@ -4,6 +4,8 @@
 <dict>
 	<key>LSMultipleInstancesProhibited</key>
 	<true/>
+	<key>NSAppleEventsUsageDescription</key>
+	<string>iMCP scripts the Reminders app to identify subtasks, because EventKit does not expose the parent/child relationship between reminders.</string>
 	<key>NSBonjourServices</key>
 	<array>
 		<string>_mcp._tcp</string>
