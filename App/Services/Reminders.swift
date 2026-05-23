@@ -87,6 +87,17 @@ final class RemindersService: Service {
         return ids
     }
 
+    /// Parse "#RRGGBB" or "RRGGBB" into a CGColor. Returns nil for malformed input.
+    private func parseHexColor(_ input: String) -> CGColor? {
+        var hex = input.trimmingCharacters(in: .whitespacesAndNewlines)
+        if hex.hasPrefix("#") { hex.removeFirst() }
+        guard hex.count == 6, let rgb = UInt32(hex, radix: 16) else { return nil }
+        let r = CGFloat((rgb >> 16) & 0xFF) / 255.0
+        let g = CGFloat((rgb >> 8) & 0xFF) / 255.0
+        let b = CGFloat(rgb & 0xFF) / 255.0
+        return CGColor(red: r, green: g, blue: b, alpha: 1.0)
+    }
+
     var isActivated: Bool {
         get async {
             return EKEventStore.authorizationStatus(for: .reminder) == .fullAccess
@@ -131,6 +142,122 @@ final class RemindersService: Service {
                     "isSubscribed": .bool(reminderList.isSubscribed),
                 ])
             }
+        }
+
+        Tool(
+            name: "reminders_lists_create",
+            description: """
+                Create a new reminder list. The list appears in Reminders.app immediately and can be passed by name to reminders_create / reminders_fetch.
+
+                Note: list names are not unique — creating a list with a name that already exists is allowed and will produce a second, separate list with the same display name.
+                """,
+            inputSchema: .object(
+                properties: [
+                    "name": .string(
+                        description: "Title of the new list. Cannot be empty."
+                    ),
+                    "source": .string(
+                        description:
+                            "Name of the account (source) to create the list in, e.g. 'iCloud' or 'On My Mac'. Defaults to the source of the user's primary reminders list. Call reminders_lists to see available source names."
+                    ),
+                    "color": .string(
+                        description:
+                            "Optional list color as a hex string like '#FF8800' or 'FF8800'. EventKit assigns a color if omitted."
+                    ),
+                ],
+                required: ["name"],
+                additionalProperties: false
+            ),
+            annotations: .init(
+                title: "Create Reminder List",
+                destructiveHint: true,
+                openWorldHint: false
+            )
+        ) { arguments in
+            try await self.activate()
+
+            guard EKEventStore.authorizationStatus(for: .reminder) == .fullAccess else {
+                log.error("Reminders access not authorized")
+                throw NSError(
+                    domain: "RemindersError",
+                    code: 1,
+                    userInfo: [NSLocalizedDescriptionKey: "Reminders access not authorized"]
+                )
+            }
+
+            guard case .string(let name) = arguments["name"], !name.isEmpty else {
+                throw NSError(
+                    domain: "RemindersError",
+                    code: 2,
+                    userInfo: [
+                        NSLocalizedDescriptionKey: "List name is required and cannot be empty"
+                    ]
+                )
+            }
+
+            // Pick the source: explicit > default reminders calendar's source > first available
+            let source: EKSource
+            if case .string(let sourceName) = arguments["source"] {
+                guard
+                    let matching = self.eventStore.sources
+                        .first(where: { $0.title.lowercased() == sourceName.lowercased() })
+                else {
+                    let available = self.eventStore.sources.map { $0.title }.joined(
+                        separator: ", "
+                    )
+                    throw NSError(
+                        domain: "RemindersError",
+                        code: 9,
+                        userInfo: [
+                            NSLocalizedDescriptionKey:
+                                "No account found named '\(sourceName)'. Available: \(available)"
+                        ]
+                    )
+                }
+                source = matching
+            } else if let defaultSource = self.eventStore.defaultCalendarForNewReminders()?
+                .source
+            {
+                source = defaultSource
+            } else if let first = self.eventStore.sources.first {
+                source = first
+            } else {
+                throw NSError(
+                    domain: "RemindersError",
+                    code: 10,
+                    userInfo: [
+                        NSLocalizedDescriptionKey: "No reminder accounts are available"
+                    ]
+                )
+            }
+
+            let newList = EKCalendar(for: .reminder, eventStore: self.eventStore)
+            newList.title = name
+            newList.source = source
+
+            if case .string(let colorStr) = arguments["color"], !colorStr.isEmpty {
+                guard let cgColor = self.parseHexColor(colorStr) else {
+                    throw NSError(
+                        domain: "RemindersError",
+                        code: 11,
+                        userInfo: [
+                            NSLocalizedDescriptionKey:
+                                "Invalid 'color' value '\(colorStr)' — expected hex like '#RRGGBB'."
+                        ]
+                    )
+                }
+                newList.cgColor = cgColor
+            }
+
+            try self.eventStore.saveCalendar(newList, commit: true)
+
+            return Value.object([
+                "title": .string(newList.title),
+                "source": .string(newList.source.title),
+                "color": .string(newList.color.accessibilityName),
+                "isEditable": .bool(newList.allowsContentModifications),
+                "isSubscribed": .bool(newList.isSubscribed),
+            ])
         }
 
         Tool(
@@ -416,6 +543,173 @@ final class RemindersService: Service {
             }
 
             // Save the reminder
+            try self.eventStore.save(reminder, commit: true)
+
+            var action = PlanAction(reminder)
+            action.identifier = reminder.calendarItemIdentifier
+            return action
+        }
+
+        Tool(
+            name: "reminders_edit",
+            description: """
+                Edit an existing reminder. Provide only the fields you want to change; omitted fields are left as-is. Use the '@id' value returned by reminders_fetch or reminders_create.
+
+                Clearing semantics: pass an empty string for 'due' or 'notes' to clear the value; pass an empty array for 'alarms' to remove all alarms; set 'priority' to 'none' to clear priority.
+
+                Note: this tool cannot change a reminder's parent/child (subtask) relationship — that must be done by the user in the Reminders app.
+                """,
+            inputSchema: .object(
+                properties: [
+                    "id": .string(
+                        description: "Identifier of the reminder to edit."
+                    ),
+                    "title": .string(
+                        description: "New title. Cannot be empty."
+                    ),
+                    "due": .string(
+                        description:
+                            "New due date/time. If timezone is omitted, local time is assumed. Date-only uses local midnight. Empty string clears the due date.",
+                        format: .dateTime
+                    ),
+                    "list": .string(
+                        description: "Move the reminder to this list (by name)."
+                    ),
+                    "notes": .string(
+                        description: "Reminder body. Empty string clears it."
+                    ),
+                    "priority": .string(
+                        enum: EKReminderPriority.allCases.map { .string($0.stringValue) }
+                    ),
+                    "alarms": .array(
+                        description:
+                            "Minutes before due date for alarms. Empty array removes all existing alarms.",
+                        items: .integer()
+                    ),
+                    "completed": .boolean(
+                        description:
+                            "Mark complete (true) or incomplete (false). Completing auto-records the current time; uncompleting clears the completion date."
+                    ),
+                ],
+                required: ["id"],
+                additionalProperties: false
+            ),
+            annotations: .init(
+                title: "Edit Reminder",
+                destructiveHint: true,
+                openWorldHint: false
+            )
+        ) { arguments in
+            try await self.activate()
+
+            guard EKEventStore.authorizationStatus(for: .reminder) == .fullAccess else {
+                log.error("Reminders access not authorized")
+                throw NSError(
+                    domain: "RemindersError",
+                    code: 1,
+                    userInfo: [NSLocalizedDescriptionKey: "Reminders access not authorized"]
+                )
+            }
+
+            guard case .string(let id) = arguments["id"] else {
+                throw NSError(
+                    domain: "RemindersError",
+                    code: 2,
+                    userInfo: [NSLocalizedDescriptionKey: "Reminder id is required"]
+                )
+            }
+
+            guard
+                let reminder = self.eventStore.calendarItem(withIdentifier: id) as? EKReminder
+            else {
+                throw NSError(
+                    domain: "RemindersError",
+                    code: 4,
+                    userInfo: [NSLocalizedDescriptionKey: "No reminder found with id '\(id)'"]
+                )
+            }
+
+            // title — present means set; empty rejected (reminders need a title)
+            if case .string(let title) = arguments["title"] {
+                guard !title.isEmpty else {
+                    throw NSError(
+                        domain: "RemindersError",
+                        code: 6,
+                        userInfo: [NSLocalizedDescriptionKey: "Title cannot be empty"]
+                    )
+                }
+                reminder.title = title
+            }
+
+            // due — present and empty clears; non-empty parses as ISO 8601
+            if case .string(let dueStr) = arguments["due"] {
+                if dueStr.isEmpty {
+                    reminder.dueDateComponents = nil
+                } else if let parsed = ISO8601DateFormatter.parsedLenientISO8601Date(
+                    fromISO8601String: dueStr
+                ) {
+                    let cal = Calendar.current
+                    let normalized = cal.normalizedStartDate(
+                        from: parsed.date,
+                        isDateOnly: parsed.isDateOnly
+                    )
+                    reminder.dueDateComponents = cal.dateComponents(
+                        [.year, .month, .day, .hour, .minute, .second],
+                        from: normalized
+                    )
+                } else {
+                    throw NSError(
+                        domain: "RemindersError",
+                        code: 7,
+                        userInfo: [
+                            NSLocalizedDescriptionKey:
+                                "Invalid 'due' value '\(dueStr)' — expected ISO 8601 or empty string to clear."
+                        ]
+                    )
+                }
+            }
+
+            // list — present means move to that list (by name)
+            if case .string(let listName) = arguments["list"] {
+                guard
+                    let target = self.eventStore.calendars(for: .reminder)
+                        .first(where: { $0.title.lowercased() == listName.lowercased() })
+                else {
+                    throw NSError(
+                        domain: "RemindersError",
+                        code: 8,
+                        userInfo: [
+                            NSLocalizedDescriptionKey:
+                                "No reminder list found named '\(listName)'"
+                        ]
+                    )
+                }
+                reminder.calendar = target
+            }
+
+            // notes — empty clears, non-empty sets
+            if case .string(let notes) = arguments["notes"] {
+                reminder.notes = notes.isEmpty ? nil : notes
+            }
+
+            // priority — 'none' clears (EKReminderPriority.none == raw 0)
+            if case .string(let priorityStr) = arguments["priority"] {
+                reminder.priority = Int(EKReminderPriority.from(string: priorityStr).rawValue)
+            }
+
+            // alarms — present replaces; empty array removes all
+            if case .array(let alarmMinutes) = arguments["alarms"] {
+                reminder.alarms = alarmMinutes.compactMap {
+                    guard case .int(let minutes) = $0 else { return nil }
+                    return EKAlarm(relativeOffset: TimeInterval(-minutes * 60))
+                }
+            }
+
+            // completed — toggles isCompleted; EventKit auto-manages completionDate
+            if case .bool(let completed) = arguments["completed"] {
+                reminder.isCompleted = completed
+            }
+
             try self.eventStore.save(reminder, commit: true)
 
             var action = PlanAction(reminder)
